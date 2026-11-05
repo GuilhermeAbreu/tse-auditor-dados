@@ -1,0 +1,83 @@
+# Publica o site (aba Análise do TSE Auditor no navegador) no GitHub Pages com os dados do último Release.
+# O site em site/ vem de "npm run site" no tse-auditor. Aqui só entram os dados: os dados_* do Release,
+# conferidos pelo SHA256SUMS e recortados com o mesmo SQL de RECORTE em scripts/site.ts.
+name: Site
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  montar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Baixar e conferir os dados do último Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir brutos
+          gh release download --repo "$GITHUB_REPOSITORY" --dir brutos --pattern 'dados_*' --pattern metadados.json --pattern SHA256SUMS
+          cd brutos && sha256sum -c --ignore-missing --quiet SHA256SUMS
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Recortar os dados para o site
+        run: |
+          pip install --quiet duckdb==1.4.1
+          python - <<'PY'
+          import os, re, shutil, duckdb
+          RECORTE = {
+              'votos': "SELECT * FROM read_parquet(?) WHERE origem = 'BU' AND codigoCargo = 1 ORDER BY pleito, mun, zona, secao",
+              'secoes': "SELECT * EXCLUDE (camposDesconhecidos, logVotosPorHora, logUrnas) FROM read_parquet(?) ORDER BY pleito, mun, zona, secao",
+          }
+          lit = lambda s: "'" + s.replace("'", "''") + "'"
+          db = duckdb.connect()
+          for f in sorted(os.listdir('brutos')):
+              m = re.fullmatch(r'dados_([A-Z]{2})_(\w+)\.parquet', f)
+              if not m:
+                  continue
+              uf, tabela = m.groups()
+              os.makedirs(f'site/dados/{uf}', exist_ok=True)
+              de, para = f'brutos/{f}', f'site/dados/{uf}/{tabela}.parquet'
+              if tabela in RECORTE:
+                  db.execute(f"COPY ({RECORTE[tabela].replace('?', lit(de))}) TO {lit(para)} (FORMAT parquet, COMPRESSION zstd)")
+              else:
+                  shutil.copyfile(de, para)
+          shutil.copyfile('brutos/metadados.json', 'site/dados/metadados.json')
+          PY
+          du -sh site/dados
+
+      - name: DuckDB-WASM (versão do site)
+        run: |
+          v=$(cat site/vendor/duckdb/VERSAO)
+          npm pack --silent "@duckdb/duckdb-wasm@$v"
+          tar -xzf duckdb-duckdb-wasm-*.tgz
+          cp package/dist/duckdb-eh.wasm package/dist/duckdb-mvp.wasm site/vendor/duckdb/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  publicar:
+    needs: montar
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
